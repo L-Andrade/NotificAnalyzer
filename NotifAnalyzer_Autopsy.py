@@ -6,6 +6,13 @@ import os
 from java.io import File
 from java.lang import System
 from java.util.logging import Level
+from javax.swing import BoxLayout
+from javax.swing import JButton
+from javax.swing import JCheckBox
+from javax.swing import JLabel
+from javax.swing import JPanel
+from javax.swing import JComponent
+from javax.swing import JTextField
 from org.sleuthkit.datamodel import SleuthkitCase
 from org.sleuthkit.datamodel import AbstractFile
 from org.sleuthkit.datamodel import ReadContentInputStream
@@ -16,9 +23,12 @@ from org.sleuthkit.autopsy.ingest.IngestModule import IngestModuleException
 from org.sleuthkit.autopsy.ingest import DataSourceIngestModule
 from org.sleuthkit.autopsy.ingest import FileIngestModule
 from org.sleuthkit.autopsy.ingest import IngestModuleFactoryAdapter
+from org.sleuthkit.autopsy.ingest import IngestModuleIngestJobSettings
+from org.sleuthkit.autopsy.ingest import IngestModuleIngestJobSettingsPanel
 from org.sleuthkit.autopsy.ingest import IngestMessage
 from org.sleuthkit.autopsy.ingest import IngestServices
 from org.sleuthkit.autopsy.ingest import ModuleDataEvent
+from org.sleuthkit.autopsy.ingest import GenericIngestModuleJobSettings
 from org.sleuthkit.autopsy.coreutils import Logger
 from org.sleuthkit.autopsy.casemodule import Case
 from org.sleuthkit.autopsy.casemodule.services import Services
@@ -39,11 +49,23 @@ class NotificationAnalyzerDataSourceIngestModuleFactory(IngestModuleFactoryAdapt
     def getModuleVersionNumber(self):
         return "0.1"
 
+    def getDefaultIngestJobSettings(self):
+        return GenericIngestModuleJobSettings()
+
+    def hasIngestJobSettingsPanel(self):
+        return True
+
+    def getIngestJobSettingsPanel(self, settings):
+        if not isinstance(settings, GenericIngestModuleJobSettings):
+            settings = GenericIngestModuleJobSettings()
+        self.settings = settings
+        return NotificationAnalyzerWithUISettingsPanel(self.settings)
+
     def isDataSourceIngestModuleFactory(self):
         return True
 
     def createDataSourceIngestModule(self, ingestOptions):
-        return NotificationAnalyzerDataSourceIngestModule()
+        return NotificationAnalyzerDataSourceIngestModule(self.settings)
 
 # Data Source-level ingest module.  One gets created per data source.
 class NotificationAnalyzerDataSourceIngestModule(DataSourceIngestModule):
@@ -53,8 +75,9 @@ class NotificationAnalyzerDataSourceIngestModule(DataSourceIngestModule):
     def log(self, level, msg):
         self._logger.logp(level, self.__class__.__name__, inspect.stack()[1][3], msg)
 
-    def __init__(self):
+    def __init__(self, settings):
         self.context = None
+        self.local_settings = settings
 
     # Where any setup and configuration is done
     # 'context' is an instance of org.sleuthkit.autopsy.ingest.IngestJobContext.
@@ -64,6 +87,13 @@ class NotificationAnalyzerDataSourceIngestModule(DataSourceIngestModule):
 
         self.temp_dir = Case.getCurrentCase().getTempDirectory()
         blackboard = Case.getCurrentCase().getServices().getBlackboard()
+        
+        self.use_undark = self.local_settings.getSetting("undark") == "true"
+        self.use_mdg = self.local_settings.getSetting("mdg") == "true"
+        self.use_crawler = self.local_settings.getSetting("crawler") == "true"
+        self.use_b2l = self.local_settings.getSetting("b2l") == "true"
+        self.python_path = self.local_settings.getSetting("python_path")
+        self.log(Level.INFO, "Python path: " + str(self.python_path))
         
         # Generic attributes
         self.att_id = self.create_attribute_type('NA_ID', BlackboardAttribute.TSK_BLACKBOARD_ATTRIBUTE_VALUE_TYPE.STRING, "ID", blackboard)
@@ -88,7 +118,6 @@ class NotificationAnalyzerDataSourceIngestModule(DataSourceIngestModule):
         # DB User Version
         self.att_db_uv = self.create_attribute_type('NA_DB_UV', BlackboardAttribute.TSK_BLACKBOARD_ATTRIBUTE_VALUE_TYPE.STRING, "SQLite User Version", blackboard)
 
-    
     # Where the analysis is done.
     # The 'dataSource' object being passed in is of type org.sleuthkit.datamodel.Content.
     # See: http://www.sleuthkit.org/sleuthkit/docs/jni-docs/latest/interfaceorg_1_1sleuthkit_1_1datamodel_1_1_content.html
@@ -99,14 +128,9 @@ class NotificationAnalyzerDataSourceIngestModule(DataSourceIngestModule):
         # we don't know how much work there is yet
         progressBar.switchToIndeterminate()
 
-        # Use blackboard class to index blackboard artifacts for keyword search
         blackboard = Case.getCurrentCase().getServices().getBlackboard()
         moduleName = NotificationAnalyzerDataSourceIngestModuleFactory.moduleName
 
-        # For our example, we will use FileManager to get all
-        # files with the word "test"
-        # in the name and then count and read them
-        # FileManager API: http://sleuthkit.org/autopsy/docs/api-docs/latest/classorg_1_1sleuthkit_1_1autopsy_1_1casemodule_1_1services_1_1_file_manager.html
         fileManager = Case.getCurrentCase().getServices().getFileManager()
         files = fileManager.findFiles(dataSource, "wpndatabase.db") 
 
@@ -129,12 +153,11 @@ class NotificationAnalyzerDataSourceIngestModule(DataSourceIngestModule):
             temp_file = os.path.join(self.temp_dir, file.getName())
             ContentUtils.writeToFile(file, File(temp_file))
 
-            # TODO: Get python path
             path_to_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "NotifAnalyzer.py")
             result_file = os.path.join(self.temp_dir, "result.json")
             self.log(Level.INFO, "Saving notification output to " + str(result_file))
             with open(os.path.join(self.temp_dir, 'na-debug.log'), 'w') as f:
-                subprocess.Popen(["python", path_to_script, '-p', temp_file, '-j', result_file],stdout=f).communicate()
+                subprocess.Popen([self.python_path, path_to_script, '-p', temp_file, '-j', result_file],stdout=f).communicate()
             with open(result_file) as json_file:
                 data = json.load(json_file)
                 
@@ -212,3 +235,100 @@ class NotificationAnalyzerDataSourceIngestModule(DataSourceIngestModule):
         except Exception as e:
             self.log(Level.INFO, "Error getting or adding attribute type: " + att_desc + " " + str(e))
         return att_type
+
+# UI that is shown to user for each ingest job so they can configure the job.
+class NotificationAnalyzerWithUISettingsPanel(IngestModuleIngestJobSettingsPanel):
+    # Note, we can't use a self.settings instance variable.
+    # Rather, self.local_settings is used.
+    # https://wiki.python.org/jython/UserGuide#javabean-properties
+    # Jython Introspector generates a property - 'settings' on the basis
+    # of getSettings() defined in this class. Since only getter function
+    # is present, it creates a read-only 'settings' property. This auto-
+    # generated read-only property overshadows the instance-variable -
+    # 'settings'
+
+    # We get passed in a previous version of the settings so that we can
+    # prepopulate the UI
+    def __init__(self, settings):
+        self.local_settings = settings
+        self.initComponents()
+        self.customizeComponents()
+
+    def checkBoxEventUndark(self, event):
+        if self.checkboxUndark.isSelected():
+            self.local_settings.setSetting("undark", "true")
+        else:
+            self.local_settings.setSetting("undark", "false")
+
+    def checkBoxEventMdg(self, event):
+        if self.checkboxMdg.isSelected():
+            self.local_settings.setSetting("mdg", "true")
+        else:
+            self.local_settings.setSetting("mdg", "false")
+
+    def checkBoxEventCrawler(self, event):
+        if self.checkboxCrawler.isSelected():
+            self.local_settings.setSetting("crawler", "true")
+        else:
+            self.local_settings.setSetting("crawler", "false")
+
+    def checkBoxEventB2l(self, event):
+        if self.checkboxB2l.isSelected():
+            self.local_settings.setSetting("b2l", "true")
+        else:
+            self.local_settings.setSetting("b2l", "false")
+    
+    def textFieldEventPythonPath(self, event):
+        self.local_settings.setSetting("python_path", self.textFieldPythonPath.getText())
+
+    def initComponents(self):
+        self.setLayout(BoxLayout(self, BoxLayout.Y_AXIS))
+        # self.setLayout(GridLayout(0,1))
+        self.setAlignmentX(JComponent.LEFT_ALIGNMENT)
+        panel1 = JPanel()
+        panel1.setLayout(BoxLayout(panel1, BoxLayout.Y_AXIS))
+        panel1.setAlignmentY(JComponent.LEFT_ALIGNMENT)
+        self.labelPythonPathText = JLabel("Python path: ")
+        self.textFieldPythonPath = JTextField(1)
+        self.buttonSavePythonPath = JButton("Save", actionPerformed=self.textFieldEventPythonPath)
+
+        self.labelCheckText = JLabel("Run recoveries: ")
+
+        self.checkboxUndark = JCheckBox("Undark", actionPerformed=self.checkBoxEventUndark)
+        self.checkboxMdg = JCheckBox("MGD Delete Parser", actionPerformed=self.checkBoxEventMdg)
+        self.checkboxCrawler = JCheckBox("WAL Crawler", actionPerformed=self.checkBoxEventCrawler)
+        self.checkboxB2l = JCheckBox("bring2lite", actionPerformed=self.checkBoxEventB2l)
+        
+        self.checkboxUndark.setSelected(True)
+        self.checkboxMdg.setSelected(True)
+        
+        self.add(self.labelPythonPathText)
+        panel1.add(self.textFieldPythonPath)
+        panel1.add(self.buttonSavePythonPath)
+
+        panel1.add(self.labelCheckText)
+        panel1.add(self.checkboxUndark)
+        panel1.add(self.checkboxMdg)
+        panel1.add(self.checkboxCrawler)
+        panel1.add(self.checkboxB2l)
+        self.add(panel1)
+
+    def customizeComponents(self):
+        # Set defaults if not set
+        if not self.local_settings.getSetting("undark"):
+            self.local_settings.setSetting("undark", "true")
+        if not self.local_settings.getSetting("mdg"):
+            self.local_settings.setSetting("mdg", "true")
+        if not self.local_settings.getSetting("python_path"):
+            self.local_settings.setSetting("python_path", "python")
+
+        # Update checkboxes with stored settings
+        self.checkboxUndark.setSelected(self.local_settings.getSetting("undark") == "true")
+        self.checkboxMdg.setSelected(self.local_settings.getSetting("mdg") == "true")
+        self.checkboxCrawler.setSelected(self.local_settings.getSetting("crawler") == "true")
+        self.checkboxB2l.setSelected(self.local_settings.getSetting("b2l") == "true")
+        self.textFieldPythonPath.setText(self.local_settings.getSetting("python_path"))
+
+    # Return the settings used
+    def getSettings(self):
+        return self.local_settings
